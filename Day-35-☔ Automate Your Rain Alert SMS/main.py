@@ -23,7 +23,7 @@ response.raise_for_status()
 
 weather_data = response.json()
 
-will_rain = False   # ✅ FIX
+will_rain = True   # ✅ FIX
 
 for hour_data in weather_data["list"]:
     condition_code = hour_data["weather"][0]["id"]
