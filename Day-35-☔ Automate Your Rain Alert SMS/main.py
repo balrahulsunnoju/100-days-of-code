@@ -43,3 +43,7 @@ if will_rain:
     print(message.status)
 else:
     print("No rain. No message sent.")
+print("OWM:", api_key)
+print("SID:", account_sid)
+print("TOKEN:", auth_token)
+
