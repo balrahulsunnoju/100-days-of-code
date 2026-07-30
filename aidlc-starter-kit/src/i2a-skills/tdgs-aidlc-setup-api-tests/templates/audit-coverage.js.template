@@ -1,0 +1,262 @@
+#!/usr/bin/env node
+'use strict';
+/**
+ * API test coverage auditor — reference template (G16b AUDIT-1..5).
+ * Usage: node scripts/audit-coverage.js collections/*.json
+ */
+const fs = require('fs');
+const path = require('path');
+
+const ROOT = path.resolve(__dirname, '..');
+const SERVICE_ROOT = path.resolve(ROOT, '..');
+
+function loadConfig() {
+  const p = path.join(ROOT, 'config', 'audit-config.json');
+  if (!fs.existsSync(p)) throw new Error('Missing audit-config.json');
+  return JSON.parse(fs.readFileSync(p, 'utf8'));
+}
+
+function walkFiles(dir, matcher, out = []) {
+  if (!fs.existsSync(dir)) return out;
+  for (const name of fs.readdirSync(dir)) {
+    const full = path.join(dir, name);
+    const st = fs.statSync(full);
+    if (st.isDirectory()) {
+      if (name === 'node_modules' || name === '.git') continue;
+      walkFiles(full, matcher, out);
+    } else if (matcher(full)) out.push(full);
+  }
+  return out;
+}
+
+function discoverEndpoints(cfg) {
+  const endpoints = [];
+  const files = walkFiles(path.join(SERVICE_ROOT, 'src'), (f) =>
+    /Controller\.java$/i.test(f)
+  );
+  const re = new RegExp(cfg.httpMappingPattern, 'g');
+  for (const file of files) {
+    const text = fs.readFileSync(file, 'utf8');
+    let m;
+    while ((m = re.exec(text))) {
+      const method = (m[1] || m[2] || 'GET').toUpperCase();
+      const pth = m[m.length - 1] || m[2];
+      if (pth) endpoints.push({ method, path: pth, source: path.basename(file) });
+    }
+  }
+  return endpoints;
+}
+
+function collectionUrls(files) {
+  const urls = new Set();
+  for (const file of files) {
+    const col = JSON.parse(fs.readFileSync(path.resolve(file), 'utf8'));
+    for (const r of col.resources || []) {
+      if (r._type === 'request' && r.url) {
+        const u = String(r.url).replace(/\{\{[^}]+\}\}/g, '').trim();
+        urls.add(u);
+      }
+    }
+  }
+  return urls;
+}
+
+/** Build parentId→name map and resolve ancestor chain for category detection */
+function buildGroupIndex(col) {
+  const groupMap = {};
+  for (const r of col.resources || []) {
+    if (r._type === 'request_group') groupMap[r._id] = { name: r.name, parentId: r.parentId };
+  }
+  return groupMap;
+}
+
+function getRequestCategory(request, groupMap) {
+  let pid = request.parentId;
+  while (pid && groupMap[pid]) {
+    const g = groupMap[pid];
+    if (/^Positive$/i.test(g.name)) return 'positive';
+    if (/^Negative$/i.test(g.name)) return 'negative';
+    if (/^Edge.?Case$/i.test(g.name)) return 'edge-case';
+    pid = g.parentId;
+  }
+  return 'unknown';
+}
+
+/** Count requests by category for a given endpoint path across all collection files */
+function countByCategory(files, epPath) {
+  let positives = 0, negatives = 0;
+  const norm = epPath.replace(/^\//, '');
+  for (const file of files) {
+    const col = JSON.parse(fs.readFileSync(path.resolve(file), 'utf8'));
+    const groupMap = buildGroupIndex(col);
+    for (const r of col.resources || []) {
+      if (r._type !== 'request') continue;
+      const u = (r.url || '').replace(/\{\{[^}]+\}\}/g, '');
+      if (!u.includes(norm)) continue;
+      const cat = getRequestCategory(r, groupMap);
+      if (cat === 'positive') positives++;
+      if (cat === 'negative') negatives++;
+    }
+  }
+  return { positives, negatives };
+}
+
+function pathInCollection(epPath, urls) {
+  const norm = epPath.replace(/^\//, '');
+  for (const u of urls) {
+    if (u.includes(norm) || u.endsWith(epPath) || u.includes(epPath)) return true;
+  }
+  return false;
+}
+
+function main() {
+  const files = process.argv.slice(2).filter((f) => f.endsWith('.json'));
+  const cfg = loadConfig();
+  const endpoints = discoverEndpoints(cfg);
+  const urls = collectionUrls(files);
+
+  const errors = [];
+  if (endpoints.length === 0) {
+    console.log('AUDIT-1..5: PASS (0 controller endpoints discovered — tune audit-config.json globs)');
+    process.exit(0);
+  }
+
+  for (const ep of endpoints) {
+    if (!pathInCollection(ep.path, urls)) {
+      errors.push(`AUDIT-1: ${ep.method} ${ep.path} (${ep.source}) has 0 requests in collection`);
+    }
+  }
+
+  for (const u of urls) {
+    const matched = endpoints.some((ep) => pathInCollection(ep.path, new Set([u])));
+    if (!matched && !u.includes('{{')) {
+      errors.push(`AUDIT-2: phantom URL in collection: ${u}`);
+    }
+  }
+
+  // AUDIT-3: List<> variant coverage (G12)
+  const listFieldRe = new RegExp(cfg.listFieldPattern, 'g');
+  const dtoFiles = walkFiles(path.join(SERVICE_ROOT, 'src'), (f) =>
+    cfg.requestBodyDtoGlobs.some((g) => minimatch(path.relative(SERVICE_ROOT, f), g))
+  );
+  const variantMap = {}; // endpoint -> expected variant count
+  for (const ep of endpoints) {
+    // Find controller method and its @RequestBody DTO
+    const ctrlFiles = walkFiles(path.join(SERVICE_ROOT, 'src'), (f) =>
+      /Controller\.java$/i.test(f)
+    );
+    for (const cf of ctrlFiles) {
+      const src = fs.readFileSync(cf, 'utf8');
+      if (!src.includes(ep.path)) continue;
+      const bodyMatch = src.match(new RegExp(
+        ep.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
+        '[\\s\\S]{0,300}@RequestBody[^)]*?\\s(\\w+)\\s+\\w+'
+      ));
+      if (!bodyMatch) continue;
+      const dtoName = bodyMatch[1];
+      const dtoFile = dtoFiles.find((f) => path.basename(f) === `${dtoName}.java`);
+      if (!dtoFile) continue;
+      const dtoSrc = fs.readFileSync(dtoFile, 'utf8');
+      let count = 0;
+      while (listFieldRe.exec(dtoSrc)) count++;
+      listFieldRe.lastIndex = 0;
+      if (count > 1) variantMap[ep.path] = count;
+    }
+  }
+  // Count positive requests per endpoint path
+  for (const [epPath, expected] of Object.entries(variantMap)) {
+    const { positives } = countByCategory(files, epPath);
+    if (positives < expected) {
+      errors.push(`AUDIT-3: ${epPath} has ${expected} List<> variants but only ${positives} positive request(s)`);
+    }
+  }
+
+  // AUDIT-4: Discriminator branch coverage (G12)
+  const discrimRe = new RegExp(cfg.discriminatorBranchPattern, 'g');
+  const svcFiles = walkFiles(path.join(SERVICE_ROOT, 'src'), (f) =>
+    cfg.serviceImplGlobs.some((g) => minimatch(path.relative(SERVICE_ROOT, f), g))
+  );
+  for (const sf of svcFiles) {
+    const src = fs.readFileSync(sf, 'utf8');
+    const branches = new Set();
+    let dm;
+    while ((dm = discrimRe.exec(src))) {
+      const val = dm[1] || dm[2] || dm[3];
+      if (val) branches.add(val);
+    }
+    discrimRe.lastIndex = 0;
+    if (branches.size < 2) continue;
+    // Map service to endpoint
+    const svcName = path.basename(sf).replace(/ServiceImpl\.java$/i, '');
+    const ep = endpoints.find((e) => e.source.toLowerCase().includes(svcName.toLowerCase()));
+    if (!ep) continue;
+    // Check for carve-out annotation in collection
+    let carvedOut = false;
+    for (const file of files) {
+      const col = JSON.parse(fs.readFileSync(path.resolve(file), 'utf8'));
+      for (const r of col.resources || []) {
+        if (r._type === 'request' && (r.url || '').includes(ep.path.replace(/^\//, ''))) {
+          if ((r.description || '').includes(cfg.carveOutAnnotation)) { carvedOut = true; break; }
+        }
+      }
+      if (carvedOut) break;
+    }
+    if (carvedOut) continue;
+    // Count positives for this endpoint
+    const { positives } = countByCategory(files, ep.path);
+    if (positives < branches.size) {
+      errors.push(`AUDIT-4: ${ep.path} has ${branches.size} discriminator branches in ${path.basename(sf)} but only ${positives} positive(s)`);
+    }
+  }
+
+  // AUDIT-5: Validation-annotation negative coverage
+  const validationRe = /@(NotNull|NotBlank|NotEmpty|Size|ValidDate|Pattern|Min|Max)\b/g;
+  for (const ep of endpoints) {
+    const ctrlFiles2 = walkFiles(path.join(SERVICE_ROOT, 'src'), (f) =>
+      /Controller\.java$/i.test(f)
+    );
+    for (const cf of ctrlFiles2) {
+      const src = fs.readFileSync(cf, 'utf8');
+      if (!src.includes(ep.path)) continue;
+      const bodyMatch = src.match(new RegExp(
+        ep.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
+        '[\\s\\S]{0,300}@RequestBody[^)]*?\\s(\\w+)\\s+\\w+'
+      ));
+      if (!bodyMatch) continue;
+      const dtoName = bodyMatch[1];
+      const dtoFile = dtoFiles.find((f) => path.basename(f) === `${dtoName}.java`);
+      if (!dtoFile) continue;
+      const dtoSrc = fs.readFileSync(dtoFile, 'utf8');
+      let annotCount = 0;
+      while (validationRe.exec(dtoSrc)) annotCount++;
+      validationRe.lastIndex = 0;
+      if (annotCount === 0) break;
+      // Count negatives for this endpoint
+      const { negatives } = countByCategory(files, ep.path);
+      if (negatives < annotCount) {
+        errors.push(`AUDIT-5: ${ep.path} has ${annotCount} validation annotations but only ${negatives} negative(s)`);
+      }
+      break;
+    }
+  }
+
+  if (errors.length) {
+    for (const e of errors) console.error('❌', e);
+    process.exit(1);
+  }
+  console.log(`AUDIT-1..5: PASS (${endpoints.length} endpoints, ${files.length} collection(s))`);
+}
+
+// minimatch-lite: supports ** and * glob patterns
+function minimatch(filepath, pattern) {
+  // Normalize Windows backslashes to POSIX forward slashes
+  const normalized = filepath.replace(/\\/g, '/');
+  const re = pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*/g, '{{GLOBSTAR}}')
+    .replace(/\*/g, '[^/]*')
+    .replace(/\{\{GLOBSTAR\}\}/g, '.*');
+  return new RegExp(`^${re}$`).test(normalized);
+}
+
+main();

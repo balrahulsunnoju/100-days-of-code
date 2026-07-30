@@ -1,0 +1,56 @@
+{
+ "servers": {
+  "github-mcp": {
+   "type": "http",
+   "url": "https://api.githubcopilot.com/mcp/",
+   "headers" : {
+    "X-MCP-Toolsets": "default,projects,actions"
+   }
+  },
+//   "splunk-mcp-server": {
+//    "command": "npx",
+//    "args": [
+//     "-y",
+//     "mcp-remote",
+//     "https://<SPLUNK_HOST>:<SPLUNK_PORT>/services/mcp",
+//     "--header",
+//     "Authorization: Bearer <SPLUNK_MCP_ENCRYPTED_TOKEN>"
+//    ]
+//   },
+
+  // ─── Database MCP Servers (Optional — uncomment and configure as needed) ───
+  //
+  // See: tdgs-aidlc-starter-kit/doc/mcp-setup-guide.md
+  //
+  // "sqlcl-mcp": {
+  //   "type": "stdio",
+  //   "command": "${userHome}/sqlcl/bin/sql",
+  //   "args": ["-mcp"]
+  // },
+  // "mysql-mcp": {
+  //   "type": "stdio",
+  //   "command": "/bin/zsh",
+  //   "args": [
+  //     "${userHome}/.dbtools/mysql-mcp.sh",
+  //     "<MYSQL_CONNECTION_NAME>"
+  //   ]
+  // },
+  // "pg-mcp": {
+  //   "type": "stdio",
+  //   "command": "/bin/zsh",
+  //   "args": [
+  //     "${userHome}/.dbtools/pg-mcp.sh",
+  //     "<PG_CONNECTION_NAME>"
+  //   ]
+  // },
+  // "mongodb": {
+  //   "type": "stdio",
+  //   "command": "/bin/zsh",
+  //   "args": [
+  //     "${userHome}/.dbtools/mongo-mcp.sh",
+  //     "readonly"
+  //   ]
+  // }
+ },
+ "inputs": []
+}

@@ -1,0 +1,13 @@
+{
+  "controllerGlobs": ["src/main/java/**/*Controller.java"],
+  "requestBodyDtoGlobs": ["src/main/java/**/model/**/*.java", "src/main/java/**/dto/**/*.java"],
+  "serviceImplGlobs": ["src/main/java/**/service/impl/*.java", "src/main/java/**/service/*ServiceImpl.java"],
+  "constantsGlobs": ["src/main/java/**/utils/*Constants.java", "src/main/java/**/constants/*.java"],
+  "httpMappingPattern": "@(Get|Post|Put|Delete|Patch)Mapping\\s*\\(\\s*(?:(?:path|value)\\s*=\\s*)?\"([^\"]+)\"",
+  "listFieldPattern": "private\\s+List<(\\w+)>\\s+(\\w+)\\s*;",
+  "discriminatorBranchPattern": "(?:if\\s*\\(.*?\\.(?:equals|contains|startsWith)\\(\"([^\"]+)\"\\)|case\\s+\"([^\"]+)\"\\s*:|\\.is(\\w+)\\(\\))",
+  "apigeeBundleGlobs": ["../apigee-exports/*.zip"],
+  "uiCallerGlobs": ["../*-ui*/src/api/**/*.{js,ts,jsx,tsx}", "../*-client*/src/**/*.{js,ts}"],
+  "externalCallers": [],
+  "carveOutAnnotation": "(variant coverage inherited from"
+}

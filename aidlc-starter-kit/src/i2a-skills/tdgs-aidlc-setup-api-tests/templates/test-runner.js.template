@@ -1,0 +1,706 @@
+#!/usr/bin/env node
+'use strict';
+/**
+ * API test runner — canonical reference template (tx-ovra-orderdetails-service).
+ * Copy to {service-repo}/api-tests/scripts/test-runner.js and set SERVICE_NAME.
+ * Contract: tools/runner-contract.md in tdgs-aidlc-setup-api-tests skill.
+ */
+const fs = require('fs');
+const path = require('path');
+const { execFileSync, spawnSync } = require('child_process');
+const crypto = require('crypto');
+const axios = require('axios');
+const yaml = require('js-yaml');
+const Ajv = require('ajv');
+const addFormats = require('ajv-formats');
+
+const SERVICE_NAME = '{{SERVICE_NAME}}';
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+
+// Sync sleep without CPU spin (Atomics.wait blocks the thread without busy-loop). Required
+// because persistCatalogStatus() is called from a sync code path.
+const _waitBuf = new Int32Array(new SharedArrayBuffer(4));
+function syncSleep(ms) { Atomics.wait(_waitBuf, 0, 0, Math.max(1, ms | 0)); }
+
+function tryStealStaleLock(lockPath) {
+  // Returns true if a stale lock was removed (holder PID dead OR lock > 120s old).
+  try {
+    const lockContent = fs.readFileSync(lockPath, 'utf8');
+    const lockPid = parseInt(lockContent.split('\n')[0], 10);
+    const lockTime = parseInt(lockContent.split('\n')[1], 10);
+    let pidAlive = true;
+    try { process.kill(lockPid, 0); } catch { pidAlive = false; }
+    if (!pidAlive || (Date.now() - lockTime > 120000)) {
+      console.warn(`[CATALOG] Removing stale lock (pid=${lockPid} alive=${pidAlive}, age=${Date.now() - lockTime}ms)`);
+      try { fs.unlinkSync(lockPath); return true; } catch { return false; }
+    }
+  } catch { /* lock unreadable or already gone */ }
+  return false;
+}
+
+function acquireCatalogLock(lockPath, timeoutMs) {
+  // Stale-lock peek BEFORE wait loop (recovery path for crashed runners).
+  const start = Date.now();
+  try { fs.writeFileSync(lockPath, `${process.pid}\n${Date.now()}`, { flag: 'wx' }); return; }
+  catch (e) {
+    if (tryStealStaleLock(lockPath)) {
+      try { fs.writeFileSync(lockPath, `${process.pid}\n${Date.now()}`, { flag: 'wx' }); return; } catch {}
+    }
+  }
+  while (true) {
+    try { fs.writeFileSync(lockPath, `${process.pid}\n${Date.now()}`, { flag: 'wx' }); return; }
+    catch (e) {
+      if (Date.now() - start > timeoutMs) {
+        if (tryStealStaleLock(lockPath)) {
+          try { fs.writeFileSync(lockPath, `${process.pid}\n${Date.now()}`, { flag: 'wx' }); return; } catch {}
+        }
+        throw new Error(`Catalog lock held > ${timeoutMs}ms: ${lockPath}`);
+      }
+      // Backoff 50-150ms (zero-delay spin starves holder; spin loop pegs core to 100%).
+      syncSleep(50 + Math.floor(Math.random() * 100));
+    }
+  }
+}
+
+function persistCatalogStatus(poolData) {
+  if (!poolData || !poolData.catalogPath) return;
+  const lockPath = poolData.catalogPath + '.lock';
+  const tmpPath = poolData.catalogPath + '.tmp';
+  acquireCatalogLock(lockPath, 30000);
+  try {
+    // READ-MERGE-WRITE (MANDATORY): re-read the catalog INSIDE the lock so concurrent
+    // service runners don't clobber each other's pool status updates.
+    // Only merge records this run actually touched (identified by lastUsedRunId === poolData._runId).
+    let diskCatalog = poolData.catalog;
+    try {
+      const freshRaw = fs.readFileSync(poolData.catalogPath, 'utf8');
+      diskCatalog = yaml.load(freshRaw);
+      if (diskCatalog?.identityPools && poolData.catalog?.identityPools) {
+        for (const memPool of poolData.catalog.identityPools) {
+          const memKey = memPool.poolType || memPool.type;
+          const diskPool = diskCatalog.identityPools.find(p => (p.poolType || p.type) === memKey);
+          if (!diskPool?.records) continue;
+          for (const memRec of memPool.records || []) {
+            if (!memRec.lastUsedRunId || memRec.lastUsedRunId !== poolData._runId) continue;
+            const diskRec = diskPool.records.find(dr =>
+              dr.fields && memRec.fields && JSON.stringify(dr.fields) === JSON.stringify(memRec.fields));
+            if (!diskRec) continue;
+            // DELTA-MERGE: apply this run's increments additively on top of disk values
+            // (NOT absolute assignment — that loses concurrent writers' updates).
+            const memKeyForSnap = (memPool.poolType || memPool.type) + ':' + JSON.stringify(memRec.fields ?? {});
+            const initial = poolData._initialSnapshot?.[memKeyForSnap] || { consumedCount: 0, failureCount: 0, consecutiveFailureCount: 0 };
+            const deltaConsumed = (memRec.consumedCount ?? 0) - (initial.consumedCount ?? 0);
+            const deltaFailure  = (memRec.failureCount  ?? 0) - (initial.failureCount  ?? 0);
+            diskRec.consumedCount = Math.max(0, (diskRec.consumedCount ?? 0) + deltaConsumed);
+            diskRec.failureCount  = Math.max(0, (diskRec.failureCount  ?? 0) + deltaFailure);
+            // consecutiveFailureCount: any pass in this run zeroes it; failures-only adds.
+            if (deltaConsumed > 0 && deltaFailure === 0) {
+              diskRec.consecutiveFailureCount = 0;
+            } else if (deltaFailure > 0) {
+              diskRec.consecutiveFailureCount = (diskRec.consecutiveFailureCount ?? 0) + deltaFailure;
+            }
+            // Re-evaluate quarantine against MERGED disk values.
+            const threshold = (memPool.quarantineThreshold ?? diskPool.quarantineThreshold ?? 5);
+            if ((diskRec.consecutiveFailureCount ?? 0) >= threshold) {
+              diskRec.status = 'quarantined';
+              if (memRec.lastFailedReason) diskRec.lastFailedReason = memRec.lastFailedReason;
+            } else if (deltaConsumed > 0) {
+              if (diskRec.status !== 'quarantined') diskRec.status = 'available';
+            }
+            diskRec.lastUsedAt = memRec.lastUsedAt;
+            diskRec.lastUsedRunId = memRec.lastUsedRunId;
+          }
+          if (memPool._rotationIndex != null) {
+            // R10-C6: DELTA-MERGE _rotationIndex (NOT absolute) — preserves monotonic forward
+            // progression across concurrent writers. Index is mod available.length on read.
+            const initialIdx = poolData._initialSnapshot?.[`${memKey}::_rotationIndex`] ?? 0;
+            const deltaIdx   = (memPool._rotationIndex ?? 0) - initialIdx;
+            diskPool._rotationIndex = (diskPool._rotationIndex ?? 0) + Math.max(0, deltaIdx);
+          }
+        }
+      }
+    } catch (readErr) {
+      console.warn(`[CATALOG] Could not re-read inside lock (${readErr.message}), writing in-memory snapshot`);
+      diskCatalog = poolData.catalog;
+    }
+    fs.writeFileSync(tmpPath, yaml.dump(diskCatalog, { lineWidth: 120 }), 'utf8');
+    const fd = fs.openSync(tmpPath, 'r+'); fs.fsyncSync(fd); fs.closeSync(fd);
+    fs.renameSync(tmpPath, poolData.catalogPath);
+    console.log(`[CATALOG] Persisted pool status updates to ${poolData.catalogPath}`);
+  } finally { try { fs.unlinkSync(lockPath); } catch {} }
+}
+// Call after finalizeCatalog completes:
+
+
+const DB_ERROR_KEYWORDS = [
+  'connection refused', 'Cannot get JDBC connection', 'JDBC',
+  'Connection reset', 'table not found', 'table or view does not exist',
+  'ORA-', 'PSQLException', 'DataAccessException', 'CannotCreateTransactionException',
+  'SQLTransientConnectionException', 'CommunicationsException',
+  'SocketTimeoutException', 'UnknownHostException', 'connection pool',
+  'too many connections', 'pool exhausted', 'ECONNREFUSED', 'ENOTFOUND',
+  'Communications link failure', 'no datasource available'
+];
+// Application error pattern — the service SAID NO with a structured business error.
+// This is a CODE/business defect (status='fail'), NEVER infra, even if the body mentions 'database'.
+// Match: { "errorCode": "<APPCODE><DIGITS>", "errorMessage": "..." } or { "code": ..., "message": ... }
+const APP_ERROR_PATTERN = /"(errorCode|code|errorId)"\s*:\s*"[A-Z][A-Z0-9_]{1,20}\d{2,}"/;
+function isApplicationError(responseBody) {
+  if (!responseBody) return false;
+  const bodyStr = typeof responseBody === 'string' ? responseBody : JSON.stringify(responseBody);
+  return APP_ERROR_PATTERN.test(bodyStr);
+}
+function isDbInfraError(responseBody) {
+  if (!responseBody) return false;
+  // Application error wins — if the body has a structured errorCode it's a code/business defect, not infra.
+  if (isApplicationError(responseBody)) return false;
+  const bodyStr = typeof responseBody === 'string' ? responseBody : JSON.stringify(responseBody);
+  // Case-sensitive match for stacktrace tokens (e.g., 'JDBC', 'ORA-', 'PSQLException')
+  // and case-insensitive for prose tokens (e.g., 'connection refused').
+  const lower = bodyStr.toLowerCase();
+  return DB_ERROR_KEYWORDS.some(kw =>
+    /^[A-Z]/.test(kw) ? bodyStr.includes(kw) : lower.includes(kw.toLowerCase())
+  );
+}
+
+
+function buildAssertionFn(actual) {
+  const chain = {
+    to: { be: {}, have: {}, not: { contain: null, equal: null } },
+    equal(expected) { if (actual !== expected) throw new Error(`Expected ${JSON.stringify(expected)} but got ${JSON.stringify(actual)}`); },
+  };
+  // .to.equal(value)
+  chain.to.equal = chain.equal;
+  // .to.contain(value) / .to.include(value)
+  chain.to.contain = (val) => {
+    const s = typeof actual === 'string' ? actual : JSON.stringify(actual);
+    if (!s.includes(String(val))) throw new Error(`Expected "${s}" to contain "${val}"`);
+  };
+  chain.to.include = chain.to.contain;
+  // .to.not.contain(value)
+  chain.to.not.contain = (val) => {
+    const s = typeof actual === 'string' ? actual : JSON.stringify(actual);
+    if (s.includes(String(val))) throw new Error(`Expected "${s}" to NOT contain "${val}"`);
+  };
+  // .to.not.equal(value)
+  chain.to.not.equal = (expected) => {
+    if (actual === expected) throw new Error(`Expected ${JSON.stringify(actual)} to NOT equal ${JSON.stringify(expected)}`);
+  };
+  // .to.have.property(name)
+  chain.to.have.property = (prop) => {
+    if (typeof actual !== 'object' || actual === null || !(prop in actual))
+      throw new Error(`Expected object to have property "${prop}"`);
+  };
+  // .to.have.lengthOf(n)
+  chain.to.have.lengthOf = (n) => {
+    const len = actual && actual.length;
+    if (len !== n) throw new Error(`Expected length ${n} but got ${len}`);
+  };
+  // .to.be.oneOf([values])
+  chain.to.be.oneOf = (arr) => {
+    if (!arr.includes(actual)) throw new Error(`Expected ${JSON.stringify(actual)} to be one of ${JSON.stringify(arr)}`);
+  };
+  // .to.be.a(type) / .to.be.an(type)
+  chain.to.be.a = (type) => {
+    const t = typeof actual;
+    if (type === 'array') { if (!Array.isArray(actual)) throw new Error(`Expected array but got ${t}`); }
+    else if (t !== type) throw new Error(`Expected type "${type}" but got "${t}"`);
+  };
+  chain.to.be.an = chain.to.be.a;
+  // .to.be.above(n) / .to.be.greaterThan(n)
+  chain.to.be.above = (n) => { if (actual <= n) throw new Error(`Expected ${actual} to be above ${n}`); };
+  chain.to.be.greaterThan = chain.to.be.above;
+  // .to.be.below(n) / .to.be.lessThan(n)
+  chain.to.be.below = (n) => { if (actual >= n) throw new Error(`Expected ${actual} to be below ${n}`); };
+  chain.to.be.lessThan = chain.to.be.below;
+  // .to.be.within(low, high) — inclusive range check
+  chain.to.be.within = (low, high) => { if (actual < low || actual > high) throw new Error(`Expected ${actual} to be within ${low}..${high}`); };
+  // .to.be.true / .to.be.false / .to.be.null
+  Object.defineProperty(chain.to.be, 'true', { get() { if (actual !== true) throw new Error(`Expected true but got ${JSON.stringify(actual)}`); return true; } });
+  Object.defineProperty(chain.to.be, 'false', { get() { if (actual !== false) throw new Error(`Expected false but got ${JSON.stringify(actual)}`); return true; } });
+  Object.defineProperty(chain.to.be, 'null', { get() { if (actual !== null) throw new Error(`Expected null but got ${JSON.stringify(actual)}`); return true; } });
+  Object.defineProperty(chain.to.be, 'ok', { get() { if (!actual) throw new Error(`Expected truthy value but got ${JSON.stringify(actual)}`); return true; } });
+  // .to.match(regex)
+  chain.to.match = (re) => { if (!re.test(String(actual))) throw new Error(`Expected ${JSON.stringify(actual)} to match ${re}`); };
+  // .to.exist
+  Object.defineProperty(chain.to, 'exist', { get() { if (actual === null || actual === undefined) throw new Error(`Expected value to exist but got ${JSON.stringify(actual)}`); return true; } });
+  return chain;
+}
+
+
+
+// Mini-chai self-test — hard-fails at startup if any required method is missing.
+(function selfTestMiniChai() {
+  const REQUIRED_PATHS = [
+    // path string, sample value to expect against, args to call (or null for getter)
+    ['to.equal',           1,          [1]],
+    ['to.not.equal',       1,          [2]],
+    ['to.contain',         'abc',      ['b']],
+    ['to.include',         'abc',      ['b']],
+    ['to.not.contain',     'abc',      ['z']],
+    ['to.have.property',   { x: 1 },   ['x']],
+    ['to.have.lengthOf',   [1, 2, 3],  [3]],
+    ['to.be.oneOf',        2,          [[1, 2, 3]]],
+    ['to.be.a',            'hi',       ['string']],
+    ['to.be.an',           [1],        ['array']],
+    ['to.be.above',        5,          [1]],
+    ['to.be.greaterThan',  5,          [1]],
+    ['to.be.below',        1,          [5]],
+    ['to.be.lessThan',     1,          [5]],
+    ['to.be.within',       5,          [1, 10]],
+    ['to.be.true',         true,       null],     // getter
+    ['to.be.false',        false,      null],     // getter
+    ['to.be.null',         null,       null],     // getter
+    ['to.be.ok',           1,          null],     // getter
+    ['to.exist',           'x',        null],     // getter
+    ['to.match',           'abc123',   [/\d+/]],
+  ];
+  const missing = [];
+  const broken = [];
+  for (const [pathStr, sample, args] of REQUIRED_PATHS) {
+    const chain = buildAssertionFn(sample);
+    const parts = pathStr.split('.');
+    let node = chain;
+    let parent = null;
+    let lastKey = null;
+    try {
+      for (let i = 0; i < parts.length; i++) {
+        parent = node;
+        lastKey = parts[i];
+        node = node[lastKey];
+        if (node === undefined) {
+          missing.push(`expect(...).${pathStr}`);
+          node = null;
+          break;
+        }
+      }
+      if (node === null) continue;
+      if (args === null) {
+        // getter — accessing it should not throw for a passing sample
+        void parent[lastKey];
+      } else if (typeof node !== 'function') {
+        missing.push(`expect(...).${pathStr} (not a function — got ${typeof node})`);
+      } else {
+        node.apply(parent, args);
+      }
+    } catch (e) {
+      broken.push(`expect(...).${pathStr} — ${e.message}`);
+    }
+  }
+  if (missing.length || broken.length) {
+    console.error('❌ MINI-CHAI SELF-TEST FAILED — runner cannot start.');
+    if (missing.length) {
+      console.error('   Missing methods (collection tests will crash with "is not a function"):');
+      for (const m of missing) console.error('     - ' + m);
+    }
+    if (broken.length) {
+      console.error('   Broken methods (returned wrong result for a known-good sample):');
+      for (const b of broken) console.error('     - ' + b);
+    }
+    console.error('');
+    console.error('   Fix: re-run /tdgs-aidlc-setup-api-tests, or extend buildAssertionFn() in');
+    console.error('   ' + __filename + ' to implement the missing methods. The mini-chai');
+    console.error('   contract is defined in /tdgs-aidlc-setup-api-tests "Mini-chai assertion');
+    console.error('   support" section. Every method in REQUIRED_PATHS above is mandatory.');
+    process.exit(2);
+  }
+})();
+
+
+
+
+// Auto-detect catalog path: scan workspace for *-docs*/test-data/test-data-catalog.yaml
+function findCatalogPath(catalogFlag) {
+  if (catalogFlag) return catalogFlag;
+  // Walk up from api-tests/scripts/ to service repo, then to workspace root
+  const workspaceRoot = path.resolve(__dirname, '..', '..', '..');
+  const entries = fs.readdirSync(workspaceRoot);
+  for (const entry of entries) {
+    if (entry.includes('-docs')) {
+      const candidate = path.join(workspaceRoot, entry, 'test-data', 'test-data-catalog.yaml');
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+// Load catalog and pick identity records from top-level identityPools
+function loadCatalogPools(catalogPath, selectedEnv) {
+  if (!catalogPath || !fs.existsSync(catalogPath)) return null;
+  const catalog = yaml.load(fs.readFileSync(catalogPath, 'utf8'));
+  const pools = catalog?.identityPools;
+  if (!pools || !Array.isArray(pools)) return null;
+  // Build lookup: { poolType: pickedRecord }
+  const resolved = {};
+  for (const pool of pools) {
+    // Only `external-required` pools hold user-pasted records resolvable here.
+    // upstream-generated: populated by capture chain. derivable-from-ui: synthesized at gen time.
+    if (pool.class !== 'external-required') continue;
+    const available = pool.records?.filter(r => r.status === 'available') || [];
+    if (available.length === 0) {
+      // Per non-prod reusability model (/tdgs-aidlc-setup-testdata): records stay 'available' on PASS.
+      // Empty `available` = pool exhausted (all `quarantined` or `reserved`). Quarantined need human
+      // release via /tdgs-aidlc-setup-testdata; reserved are in-flight in this run. Do NOT auto-recycle.
+      console.warn(`⚠️ No available ${pool.poolType} records (all reserved or quarantined). Tests needing this pool will be marked data-issue and skipped. Run /tdgs-aidlc-setup-testdata and choose 'release' to recover quarantined records, or paste additional records.`);
+      resolved[pool.poolType] = null;
+      continue;
+    }
+    // Round-robin: pick by rotation index
+    const rotationIndex = (pool._rotationIndex || 0) % available.length;
+    resolved[pool.poolType] = available[rotationIndex];
+    pool._rotationIndex = (rotationIndex + 1);
+    // Mark as reserved in memory; finalized to consumed/available based on test outcome
+    available[rotationIndex].status = 'reserved';
+  }
+  // Snapshot initial counters per record — enables persistCatalogStatus delta-merge
+  // (NOT absolute writes) so concurrent service runners don't lose each other's increments.
+  const initialSnapshot = {};
+  for (const pool of pools) {
+    const poolKey = pool.poolType || pool.type;
+    // Snapshot the pool-level _rotationIndex so persistCatalogStatus can delta-merge (R10-C6)
+    initialSnapshot[poolKey + '::_rotationIndex'] = pool._rotationIndex ?? 0;
+    for (const rec of pool.records || []) {
+      const recKey = poolKey + ':' + JSON.stringify(rec.fields ?? {});
+      initialSnapshot[recKey] = {
+        consumedCount: rec.consumedCount ?? 0,
+        failureCount: rec.failureCount ?? 0,
+        consecutiveFailureCount: rec.consecutiveFailureCount ?? 0
+      };
+    }
+  }
+  return { resolved, catalog, catalogPath, _initialSnapshot: initialSnapshot };
+}
+
+// HARD-FAIL token resolver — NEVER leaves {{...}} or substitutes synthetic placeholders.
+// Throws TokenResolutionError; caller marks test status='data-issue' and skips HTTP send.
+// Eliminates #1 production bug: literal `{{catalog.*}}` or PLACEHOLDER_* shipping to server.
+class TokenResolutionError extends Error {
+  constructor(unresolved) {
+    super(`Unresolved tokens: ${unresolved.join('; ')}`);
+    this.name = 'TokenResolutionError';
+    this.unresolved = unresolved;
+  }
+}
+function resolveCatalogTokens(text, poolData, allowPlaceholder) {
+  if (!text) return text;
+  const unresolved = [];
+  text = text.replace(/\{\{catalog\.identityPool\.([^.}]+)\.([^}]+)\}\}/g, (match, poolType, fieldName) => {
+    const record = poolData?.resolved?.[poolType];
+    if (!record) { unresolved.push(`identityPool '${poolType}' has no available record (all consumed/quarantined, or pool absent)`); return match; }
+    // Records carry their values under `fields` (per /tdgs-aidlc-setup-testdata catalog schema)
+    const v = record.fields ? record.fields[fieldName] : record[fieldName];
+    if (v === undefined || v === null) {
+      unresolved.push(`identityPool '${poolType}' record missing real value for field '${fieldName}'`);
+      return match;
+    }
+    // PLACEHOLDER values: tolerated only for env=local so backend mock services receive a string.
+    // For test/stage/prod, real agency-pasted records are required — fail loudly.
+    if (String(v).startsWith('PLACEHOLDER_')) {
+      if (!allowPlaceholder) {
+        unresolved.push(`identityPool '${poolType}' has PLACEHOLDER value for field '${fieldName}' — paste real records via /tdgs-aidlc-setup-testdata`);
+        return match;
+      }
+    }
+    return String(v);
+  });
+  // Resolve {{catalog.stubs.<service>.<field>}} from catalog stubs section
+  text = text.replace(/\{\{catalog\.stubs\.([^.}]+)\.([^}]+)\}\}/g, (match, service, fieldName) => {
+    const stubs = poolData?.catalog?.stubs;
+    if (!stubs || !stubs[service]) { unresolved.push(`catalog stubs missing service '${service}'`); return match; }
+    const v = stubs[service][fieldName];
+    if (v === undefined || v === null) { unresolved.push(`catalog stubs.${service} missing field '${fieldName}'`); return match; }
+    return String(v);
+  });
+  const leftover = text.match(/\{\{catalog\.[^}]+\}\}/g);
+  if (leftover) for (const tok of leftover) unresolved.push(`unrecognized catalog token ${tok} — only {{catalog.identityPool.<pool>.<field>}} and {{catalog.stubs.<service>.<field>}} are supported`);
+  if (unresolved.length) throw new TokenResolutionError(unresolved);
+  return text;
+}
+
+
+
+// --- Placeholder guard helpers ---
+const PLACEHOLDER_SUBSTRINGS = [
+  'placeholder@example.test', 'placeholder@example.com',
+  'PLACEHOLDER-DL', 'PLACEHOLDER-ID',
+  'placeholder-first', 'placeholder-last', 'placeholder-uid-',
+  'placeholder-string', '<placeholder'
+];
+
+function checkLiteralPlaceholder(resolvedText, suiteName, requestName) {
+  const isPositive = /Positive/i.test(suiteName || '') || /^SETUP:/i.test(requestName || '');
+  if (!isPositive) return null;
+  const lower = String(resolvedText || '').toLowerCase();
+  const hits = PLACEHOLDER_SUBSTRINGS.filter(s => lower.includes(s.toLowerCase()));
+  if (hits.length === 0) return null;
+  return { status: 'generation-bug', error: `Literal placeholder in payload: ${hits.join(', ')}`, hits };
+}
+
+function checkUnresolvedToken(resolvedText) {
+  const m = String(resolvedText || '').match(/\{\{[^}]+\}\}/);
+  if (!m) return null;
+  return { status: 'unresolved-token', error: `Unresolved token: ${m[0]}` };
+}
+
+// --- Collection loader ---
+function loadCollection(args) {
+  const collectionsDir = path.join(__dirname, '..', 'collections');
+  let collectionPath = args.collection;
+  if (!collectionPath) {
+    const files = fs.readdirSync(collectionsDir).filter(f => f.endsWith('.json'));
+    if (files.length === 0) throw new Error('No collection JSON found in collections/');
+    collectionPath = path.join(collectionsDir, files[0]);
+  }
+  if (!path.isAbsolute(collectionPath)) collectionPath = path.resolve(collectionsDir, collectionPath);
+  return { data: JSON.parse(fs.readFileSync(collectionPath, 'utf8')), path: collectionPath };
+}
+
+// --- Inso CLI primary path ---
+function tryInso(collectionPath, suiteName, envName) {
+  const insoResult = spawnSync('npx', ['inso', 'run', 'test', suiteName, '--env', envName, '--src', collectionPath], {
+    cwd: path.join(__dirname, '..'),
+    timeout: 120000,
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  if (insoResult.error && insoResult.error.code === 'ENOENT') return { available: false };
+  if (insoResult.status === null) return { available: false, reason: 'timeout' };
+  return { available: true, exitCode: insoResult.status, stdout: insoResult.stdout, stderr: insoResult.stderr };
+}
+
+// --- Node executor fallback ---
+async function runNodeExecutor(collection, config, client, poolData, args) {
+  const resources = collection.resources || [];
+  const unitTests = resources.filter(r => r._type === 'unit_test');
+  const requestsMap = {};
+  for (const r of resources.filter(r => r._type === 'request')) requestsMap[r._id] = r;
+  const foldersMap = {};
+  for (const r of resources.filter(r => r._type === 'request_group')) foldersMap[r._id] = r;
+
+  const envResource = resources.find(r => r._type === 'environment');
+  const envVars = envResource?.data || {};
+  const allowPlaceholder = String(args.env || 'local').toLowerCase() === 'local';
+  const results = [];
+
+  // Captured values from producer requests (e.g. SaveOrder → orderNumber, CreateTransaction → transactionId)
+  const capturedValues = {};
+
+  for (const ut of unitTests) {
+    const request = requestsMap[ut.requestId];
+    if (!request) {
+      results.push({ name: ut.name, status: 'skip', error: `No request found for requestId ${ut.requestId}`, durationMs: 0 });
+      continue;
+    }
+
+    // Resolve URL — replace {{ base_url }}{{ context_path }} with config values
+    let url = request.url || '';
+    url = url.replace(/\{\{\s*base_url\s*\}\}/g, config.base_url || envVars.base_url || '');
+    url = url.replace(/\{\{\s*context_path\s*\}\}/g, config.context_path || envVars.context_path || '');
+
+    // Resolve body
+    let body = request.body?.text || null;
+
+    // Resolve {{captured.<field>}} tokens from prior producer responses
+    const resolveCaptured = (text) => {
+      if (!text) return text;
+      return text.replace(/\{\{captured\.([^}]+)\}\}/g, (match, field) => {
+        if (capturedValues[field] !== undefined) return String(capturedValues[field]);
+        return match; // leave unresolved — guard will catch it
+      });
+    };
+    url = resolveCaptured(url);
+    if (body) body = resolveCaptured(body);
+
+    // Resolve catalog tokens in URL and body
+    if (poolData) {
+      try {
+        url = resolveCatalogTokens(url, poolData, allowPlaceholder);
+        if (body) body = resolveCatalogTokens(body, poolData, allowPlaceholder);
+      } catch (err) {
+        if (err.name === 'TokenResolutionError') {
+          results.push({ name: ut.name, endpoint: `${request.method} ${request.url}`, status: 'data-issue', error: err.message, durationMs: 0 });
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    // Pre-send guards (skipped in dry-run — captured tokens won't resolve without actual HTTP calls)
+    const finalText = `${url}\n${body || ''}`;
+    const folder = foldersMap[request.parentId];
+
+    // Dry-run mode — report test as skip before guards (captured tokens require real execution)
+    if (args.dryRun) {
+      results.push({ name: ut.name, endpoint: `${request.method} ${url}`, status: 'skip', error: 'dry-run', durationMs: 0 });
+      continue;
+    }
+
+    const guardFail = checkLiteralPlaceholder(finalText, folder?.name, ut.name) || checkUnresolvedToken(finalText);
+    if (guardFail) {
+      results.push({ name: ut.name, endpoint: `${request.method} ${url}`, status: guardFail.status, error: guardFail.error, durationMs: 0 });
+      continue;
+    }
+
+    // Send HTTP request
+    const start = Date.now();
+    let resp;
+    try {
+      const headers = {};
+      for (const h of request.headers || []) { if (h.name && h.value) headers[h.name] = h.value; }
+      resp = await client({ method: request.method.toLowerCase(), url, data: body ? JSON.parse(body) : undefined, headers });
+    } catch (err) {
+      results.push({ name: ut.name, endpoint: `${request.method} ${url}`, status: 'infra', error: err.message, durationMs: Date.now() - start });
+      continue;
+    }
+    const durationMs = Date.now() - start;
+
+    // Classify infra errors
+    const respBody = typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data || '');
+    if (resp.status >= 500 && isDbInfraError(respBody)) {
+      results.push({ name: ut.name, endpoint: `${request.method} ${url}`, status: 'infra', error: `DB/infra error (${resp.status})`, durationMs, response: { status: resp.status } });
+      continue;
+    }
+
+    // Capture response fields for {{captured.*}} chain (only from successful responses)
+    if (resp.status >= 200 && resp.status < 300) {
+      try {
+        const respJson = typeof resp.data === 'object' ? resp.data : JSON.parse(resp.data);
+        if (respJson) {
+          // Capture known chain fields: orderNumber, transactionId
+          if (respJson.orderNumber !== undefined) capturedValues.orderNumber = respJson.orderNumber;
+          if (respJson.transactionId !== undefined) capturedValues.transactionId = respJson.transactionId;
+        }
+      } catch (_) { /* response not JSON — skip capture */ }
+    }
+
+    // Run assertion code
+    // Test-code injection contract — see tools/runner-contract.md row "Test-code injection signature".
+    // `elapsedTime` on resp satisfies generate-api-tests unit-test-code-patterns.md rule #5 (SLA assertion).
+    // `addFormats` on insomnia satisfies generate-api-tests post-generation-checks.md Check 17
+    // (`insomnia.addFormats(ajv)` AJV plumbing). Positional `Ajv`/`addFormats` args retained for back-compat.
+    let testStatus = 'pass';
+    let testError = null;
+    try {
+      const insomnia = {
+        send: async () => ({ status: resp.status, data: respBody, headers: resp.headers, elapsedTime: durationMs }),
+        addFormats,
+      };
+      const expect = (val) => buildAssertionFn(val);
+      const testFn = new AsyncFunction('insomnia', 'expect', 'Ajv', 'addFormats', ut.code);
+      await testFn(insomnia, expect, Ajv, addFormats);
+    } catch (err) {
+      testStatus = 'fail';
+      testError = err.message;
+    }
+
+    results.push({ name: ut.name, endpoint: `${request.method} ${url}`, status: testStatus, error: testError, durationMs, response: { status: resp.status } });
+  }
+  return results;
+}
+
+// --- Main orchestration ---
+async function main() {
+  const args = parseCliArgs(process.argv.slice(2));
+  const env = args.env || 'local';
+  const config = require(path.join(__dirname, '..', 'environments', env + '.json'));
+  const client = axios.create({
+    baseURL: config.base_url + (config.context_path || ''),
+    timeout: 60000,
+    validateStatus: () => true,
+  });
+
+  const catalogPath = findCatalogPath(args.catalog);
+  const poolData = loadCatalogPools(catalogPath, env);
+  if (poolData) poolData._runId = 'run-' + new Date().toISOString();
+
+  const { data: collection, path: collectionPath } = loadCollection(args);
+  const resources = collection.resources || [];
+  const suite = resources.find(r => r._type === 'unit_test_suite');
+  const unitTests = resources.filter(r => r._type === 'unit_test');
+  const suiteName = suite?.name || SERVICE_NAME + ' API Tests';
+
+  const results = { service: SERVICE_NAME, environment: env, tests: [], summary: initSummary() };
+
+  // Primary path: try inso CLI
+  const envName = env.charAt(0).toUpperCase() + env.slice(1); // 'local' → 'Local'
+  const inso = tryInso(collectionPath, suiteName, envName);
+
+  if (inso.available && inso.exitCode === 0) {
+    // Inso passed all tests — populate results
+    console.log(`[INSO] All ${unitTests.length} tests passed via inso CLI`);
+    for (const ut of unitTests) {
+      results.tests.push({ name: ut.name, status: 'pass', error: null, durationMs: 0 });
+    }
+  } else {
+    // Fallback: node executor
+    if (inso.available) {
+      console.log(`[INSO] inso exited ${inso.exitCode} — falling back to node executor for detail`);
+      if (args.verbose && inso.stderr) console.log('[INSO stderr]', inso.stderr.slice(0, 500));
+    } else {
+      console.log(`[INSO] inso not available (${inso.reason || 'not found'}) — using node executor`);
+    }
+    results.tests = await runNodeExecutor(collection, config, client, poolData, args);
+  }
+
+  // Compute summary
+  const s = results.summary;
+  s.total = results.tests.length;
+  for (const t of results.tests) {
+    if (t.status === 'pass') { s.passed++; s.executed++; }
+    else if (t.status === 'fail') { s.failed++; s.executed++; }
+    else if (t.status === 'infra') { s.infra++; s.executed++; }
+    else if (t.status === 'data-issue' || t.status === 'unresolved-token' || t.status === 'generation-bug') { s.dataIssue++; }
+    else { s.skipped++; }
+  }
+  s.durationMs = results.tests.reduce((sum, t) => sum + (t.durationMs || 0), 0);
+  s.passRate = s.executed > 0 ? Math.round((s.passed / s.executed) * 100) : 0;
+
+  finalizeAndWriteResults(results);
+  if (poolData) persistCatalogStatus(poolData);
+
+  // Generate report
+  try {
+    execFileSync(process.execPath, [path.join(__dirname, 'generate-report.js')], { stdio: 'inherit' });
+  } catch (e) {
+    console.warn('[REPORT] generate-report.js failed (non-fatal):', e.message);
+  }
+
+  // Exit non-zero if any test failed
+  if (s.failed > 0 || s.infra > 0) process.exit(1);
+}
+
+function parseCliArgs(argv) {
+  const out = { env: 'local' };
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--env' && argv[i + 1]) out.env = argv[++i];
+    else if (argv[i] === '--catalog' && argv[i + 1]) out.catalog = argv[++i];
+    else if (argv[i] === '--collection' && argv[i + 1]) out.collection = argv[++i];
+    else if (argv[i] === '--dry-run') out.dryRun = true;
+    else if (argv[i] === '--verbose') out.verbose = true;
+    else if (argv[i] === '--tag' && argv[i + 1]) out.tag = argv[++i];
+  }
+  return out;
+}
+
+function initSummary() {
+  return { total: 0, executed: 0, passed: 0, failed: 0, skipped: 0, skippedCrossService: 0, dataIssue: 0, infra: 0, passRate: 0, durationMs: 0 };
+}
+
+function finalizeAndWriteResults(results) {
+  // Assert math invariant before write — see tools/runner-contract.md
+  const s = results.summary;
+  const sum = s.passed + s.failed + s.skipped + s.dataIssue + s.infra;
+  if (sum !== s.total) throw new Error('summary math broken: counters != total');
+  const outDir = path.join(__dirname, '..', 'test-results');
+  fs.mkdirSync(outDir, { recursive: true });
+  const resultsPath = path.join(outDir, 'results.json');
+  const prevPath = path.join(outDir, 'results.previous.json');
+  if (fs.existsSync(resultsPath)) fs.copyFileSync(resultsPath, prevPath);
+  const tmp = resultsPath + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(results, null, 2));
+  fs.renameSync(tmp, resultsPath);
+}
+
+if (require.main === module) {
+  main().catch((e) => { console.error(e); process.exit(2); });
+}

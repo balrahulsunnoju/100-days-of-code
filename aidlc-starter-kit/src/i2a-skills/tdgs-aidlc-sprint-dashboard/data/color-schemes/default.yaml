@@ -1,0 +1,21 @@
+# Default Color Scheme
+# Maps directly to CSS custom properties in dashboard-template.html :root
+name: "default"
+description: "Dark slate theme with Deloitte accent/status colors (template built-in)"
+
+colors:
+  --bg: "#0a0f1a"
+  --surface: "#111827"
+  --surface-2: "#1a2332"
+  --border: "#243044"
+  --text: "#f0f2f5"
+  --text-dim: "#c9cdd6"
+  --text-muted: "#6b7a8d"
+  --accent: "#86BC25"
+  --green: "#86BC25"
+  --yellow: "#FFD700"
+  --orange: "#FF8C00"
+  --red: "#f87171"
+  --blue: "#00A1DE"
+  --purple: "#9D4EDD"
+  --cyan: "#00D4FF"

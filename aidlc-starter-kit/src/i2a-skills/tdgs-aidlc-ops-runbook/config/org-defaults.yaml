@@ -1,0 +1,64 @@
+# Organization Defaults — Texas.gov Application Services
+# These values are CONSTANT across all applications managed by this team.
+# The runbook creation workflow auto-populates these — NEVER mark them [VERIFY].
+#
+# WHAT GOES HERE: Only values that are the SAME regardless of which app is being documented.
+# WHAT DOES NOT GO HERE: Anything discoverable from code scan (database, backend tech, packaging, ports, schemas).
+#
+# To override per-application: add the same key in project-context.md or
+# the app's knowledge-base. App-specific values take precedence.
+
+# --- Contact List (Section 2) --- SAME FOR ALL APPS
+contacts:
+  architecture_group: ustdgsarchitectteam@deloitte.com
+  mo_group: ustexasgovmoteam@deloitte.com
+  devops_group: ustexasgovdevops@deloitte.com
+  dba_group: ustxdbateam@deloitte.com
+  security_group: ustexasgovsecurity@deloitte.com
+
+# --- CI/CD (Section 5) --- SAME PIPELINE INFRASTRUCTURE FOR ALL APPS
+cicd:
+  pipeline_tool: GitHub Actions
+  reusable_workflow_source: "Texas-gov-Application-Services/txgov-devsecops-hub/.github/workflows/ci-reusable.yml@master"
+  github_org: Texas-gov-Application-Services
+  pipeline_stages:
+    - name: GitLeaks
+      tool: GitLeaks
+      purpose: Scan for secrets/credentials in code
+    - name: Build
+      tool: "Per-repo (Maven/npm/etc — from ci-common.yml)"
+      purpose: Compile source, resolve dependencies
+    - name: Unit Tests
+      tool: "Per-repo (JUnit/Jest/etc — from ci-common.yml)"
+      purpose: Run automated tests
+    - name: Veracode SAST
+      tool: Veracode
+      purpose: Static Application Security Testing
+    - name: Artifact Upload
+      tool: devsecops-hub
+      purpose: Store build artifact
+
+# --- Monitoring Platforms (Section 8) --- SAME TOOLS FOR ALL APPS
+monitoring:
+  logging_platform: Splunk
+  apm_platform: AppDynamics
+  analytics_platform: Google Analytics
+
+# --- Agency/Owner --- SAME FOR ALL APPS
+organization:
+  agency: "Texas.gov Application Services"
+  servicenow_ci_suffix: "- Production"
+
+# ============================================================
+# EVERYTHING BELOW IS DISCOVERED FROM CODE SCAN — NOT DEFAULTS
+# ============================================================
+# The following are NEVER defaulted. They come from workspace scan:
+#   - Database technology (Oracle, MySQL, PostgreSQL, etc.)
+#   - Backend packaging (WAR, JAR, Docker, etc.)
+#   - Frontend framework (React, Angular, Next.js, etc.)
+#   - API Gateway provider (Apigee, AWS API Gateway, etc.)
+#   - API Gateway security flows (app-specific proxy config)
+#   - Service ports, context paths
+#   - External integrations and their URLs
+#   - Deployment target (servlet container, ECS, Lambda, etc.)
+# ============================================================

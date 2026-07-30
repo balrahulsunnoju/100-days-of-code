@@ -1,0 +1,8 @@
+# macOS
+.DS_Store
+
+# Internal planning docs
+doc/plan/
+doc/adr/
+doc/contributing/review-report.md
+src/i2a-skills/tdgs-aidlc-delivery-metrics-dashboard/
