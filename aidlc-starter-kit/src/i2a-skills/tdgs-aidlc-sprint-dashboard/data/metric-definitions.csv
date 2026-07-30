@@ -1,8 +1,0 @@
-metric_id,name,description,level_0,level_1,level_2,level_3,level_4
-impl,Implementation,Task/subtask completion ratio,Not started,Minimal (~25%),Partial (~50%),Mostly done (~75%),Complete (100%)
-test,Tests,Test coverage and pass rate,No tests,Minimal coverage,Partial coverage,Good coverage,Full coverage
-review,Code Review,Review status and findings,Not reviewed,Major changes needed,Some issues,Minor comments,Approved
-docs,Documentation,Documentation completeness,No documentation,Minimal docs,Partial docs,Good docs,Fully documented
-arch,Architecture,Architecture pattern compliance,Not following,Major deviations,Partial compliance,Mostly compliant,Fully compliant
-qa,QA Gate,Quality assurance status,Not started,Failed,Concerns,Passed with notes,Approved
-a11y,Accessibility,WCAG compliance level,Not assessed,Major issues,Moderate issues,Minor issues,Fully accessible
